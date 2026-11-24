@@ -1,0 +1,230 @@
+# documentation: https://docs.opencloud.eu/docs/admin/getting-started/container/docker-compose/external-proxy/
+# slogan: OpenCloud provides self-hosted file sync, sharing, and collaborative editing.
+# category: storage
+# tags: files, sync, sharing, webdav, collabora, caldav, carddav
+# logo: svgs/opencloud.svg
+# port: 9200
+
+services:
+  opencloud:
+    image: opencloudeu/opencloud:9.1.1
+    user: "1000:1000"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        if [ ! -s /etc/opencloud/opencloud.yaml ]; then
+          opencloud init --insecure=false --quiet
+        fi
+        exec opencloud server
+    environment:
+      - SERVICE_URL_OPENCLOUD_9200
+      - OC_URL=${SERVICE_URL_OPENCLOUD}
+      - OC_ADD_RUN_SERVICES=collaboration
+      - PROXY_HTTP_ADDR=0.0.0.0:9200
+      - PROXY_TLS=false
+      - IDM_ADMIN_PASSWORD=${SERVICE_PASSWORD_OPENCLOUD}
+      - IDM_CREATE_DEMO_USERS=false
+      - WEB_OPTION_DISABLE_SPONSOR_LINK=${WEB_OPTION_DISABLE_SPONSOR_LINK:-false}
+      - WEB_OPTION_YJS_SERVER_URL=wss://${SERVICE_FQDN_OPENCLOUD}/yjs
+      - PROXY_CSP_CONFIG_FILE_LOCATION=/etc/opencloud/csp.yaml
+      - COLLABORA_DOMAIN=${SERVICE_FQDN_COLLABORA}
+      - COLLABORATION_WOPI_SRC=${SERVICE_URL_OPENCLOUD}
+      - COLLABORATION_APP_NAME=CollaboraOnline
+      - COLLABORATION_APP_PRODUCT=Collabora
+      - COLLABORATION_APP_ADDR=${SERVICE_URL_COLLABORA}
+      - COLLABORATION_APP_ICON=${SERVICE_URL_COLLABORA}/favicon.ico
+      - COLLABORATION_APP_INSECURE=false
+      - COLLABORATION_CS3API_DATAGATEWAY_INSECURE=false
+    volumes:
+      - opencloud-config:/etc/opencloud
+      - opencloud-data:/var/lib/opencloud
+      - type: bind
+        source: ./opencloud-proxy.yaml
+        target: /etc/opencloud/proxy.yaml
+        read_only: true
+        content: |
+          additional_policies:
+            - name: default
+              routes:
+                - endpoint: /yjs
+                  backend: http://yjs:1234
+                  unprotected: true
+                - endpoint: /caldav/
+                  backend: http://radicale:5232
+                  remote_user_header: X-Remote-User
+                  skip_x_access_token: true
+                  additional_headers:
+                    - X-Script-Name: /caldav
+                - endpoint: /.well-known/caldav
+                  backend: http://radicale:5232
+                  remote_user_header: X-Remote-User
+                  skip_x_access_token: true
+                  additional_headers:
+                    - X-Script-Name: /caldav
+                - endpoint: /carddav/
+                  backend: http://radicale:5232
+                  remote_user_header: X-Remote-User
+                  skip_x_access_token: true
+                  additional_headers:
+                    - X-Script-Name: /carddav
+                - endpoint: /.well-known/carddav
+                  backend: http://radicale:5232
+                  remote_user_header: X-Remote-User
+                  skip_x_access_token: true
+                  additional_headers:
+                    - X-Script-Name: /carddav
+      - type: bind
+        source: ./opencloud-csp.yaml
+        target: /etc/opencloud/csp.yaml
+        read_only: true
+        content: |
+          directives:
+            frame-src:
+              - 'https://${COLLABORA_DOMAIN|collabora.opencloud.test}/'
+            img-src:
+              - 'https://${COLLABORA_DOMAIN|collabora.opencloud.test}/'
+      - type: bind
+        source: ./opencloud-app-registry.yaml
+        target: /etc/opencloud/app-registry.yaml
+        read_only: true
+        content: |
+          app_registry:
+            mimetypes:
+              - mime_type: application/vnd.openxmlformats-officedocument.wordprocessingml.document
+                extension: docx
+                name: Microsoft Word
+                description: Microsoft Word document
+                default_app: Collabora
+                allow_creation: true
+              - mime_type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+                extension: xlsx
+                name: Microsoft Excel
+                description: Microsoft Excel document
+                default_app: Collabora
+                allow_creation: true
+              - mime_type: application/vnd.openxmlformats-officedocument.presentationml.presentation
+                extension: pptx
+                name: Microsoft PowerPoint
+                description: Microsoft PowerPoint document
+                default_app: Collabora
+                allow_creation: true
+              - mime_type: text/markdown
+                extension: md
+                name: Markdown file
+                description: Markdown file
+                allow_creation: true
+    healthcheck:
+      test: ["CMD", "opencloud", "proxy", "health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  radicale:
+    image: opencloudeu/radicale:v3.9.2
+    user: "1000:1000"
+    volumes:
+      - radicale-data:/var/lib/radicale
+      - type: bind
+        source: ./radicale-config
+        target: /etc/radicale/config
+        read_only: true
+        content: |
+          [server]
+          hosts = 0.0.0.0:5232
+
+          [auth]
+          type = http_x_remote_user
+
+          [rights]
+          type = owner_only
+
+          [storage]
+          filesystem_folder = /var/lib/radicale/collections
+          predefined_collections = {
+              "def-calendar": {
+                  "C:supported-calendar-component-set": "VEVENT,VJOURNAL,VTODO",
+                  "D:displayname": "Personal Calendar",
+                  "tag": "VCALENDAR"
+              },
+              "def-addressbook": {
+                  "D:displayname": "Personal Address Book",
+                  "tag": "VADDRESSBOOK"
+              }
+            }
+
+          [web]
+          type = none
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:5232/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  yjs:
+    image: opencloudeu/yjs:1.1.1
+    user: "1000:1000"
+    environment:
+      PORT: "1234"
+      OPENCLOUD_URL: http://opencloud:9200
+      SHUTDOWN_GRACE_PERIOD_MS: "15000"
+    stop_grace_period: 20s
+
+  collabora-proof-key:
+    image: alpine/openssl:3.5.9
+    restart: "no"
+    exclude_from_hc: true
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        if [ ! -s /proof/proof_key ]; then
+          umask 077
+          openssl genrsa -traditional -out /proof/proof_key.tmp 4096
+          chown 1001:1001 /proof/proof_key.tmp
+          chmod 0400 /proof/proof_key.tmp
+          mv /proof/proof_key.tmp /proof/proof_key
+        fi
+    volumes:
+      - collabora-proof-key:/proof
+
+  collabora:
+    image: collabora/code:26.04.6.1.1
+    depends_on:
+      collabora-proof-key:
+        condition: service_completed_successfully
+    environment:
+      - SERVICE_URL_COLLABORA_9980
+      - aliasgroup1=${SERVICE_URL_OPENCLOUD}
+      - username=admin
+      - password=${SERVICE_PASSWORD_COLLABORA}
+      - >-
+        extra_params=--o:ssl.enable=false
+        --o:ssl.termination=true
+        --o:ssl.ssl_verification=true
+        --o:welcome.enable=false
+        --o:net.frame_ancestors=${SERVICE_FQDN_OPENCLOUD}
+        --o:net.lok_allow.host[14]=${SERVICE_FQDN_OPENCLOUD}
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    volumes:
+      - type: volume
+        source: collabora-proof-key
+        target: /etc/coolwsd/proof_key
+        read_only: true
+        volume:
+          subpath: proof_key
+    healthcheck:
+      test: ["CMD", "/usr/bin/coolwsd", "--probe", "--use-env-vars"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  opencloud-config:
+  opencloud-data:
+  collabora-proof-key:
+  radicale-data:
